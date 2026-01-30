@@ -5,6 +5,7 @@ mod pdf;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
+use tabled::{Table, Tabled, settings::Style};
 
 use crate::config::{
     config_dir, load_clients, load_config, load_items, load_state,
@@ -12,7 +13,7 @@ use crate::config::{
     CONFIG_TEMPLATE, CLIENTS_TEMPLATE, ITEMS_TEMPLATE,
 };
 use crate::error::{InvoiceError, Result};
-use crate::invoice::generate_invoice;
+use crate::invoice::{generate_invoice, get_invoice_path, regenerate_invoice};
 
 #[derive(Parser)]
 #[command(name = "invoice")]
@@ -65,6 +66,28 @@ enum Commands {
         #[arg(short, long)]
         limit: Option<usize>,
     },
+
+    /// Edit an existing invoice's line items
+    Edit {
+        /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
+        invoice: String,
+
+        /// New line items in format "item:quantity" (replaces existing items)
+        #[arg(short, long, value_name = "ITEM:QTY")]
+        item: Vec<String>,
+    },
+
+    /// Open an invoice PDF
+    Open {
+        /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
+        invoice: String,
+    },
+
+    /// Regenerate an invoice PDF from stored data
+    Regenerate {
+        /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
+        invoice: String,
+    },
 }
 
 fn main() {
@@ -92,6 +115,9 @@ fn run() -> Result<()> {
         Commands::Items => cmd_items(&cfg_dir),
         Commands::Status { verbose } => cmd_status(&cfg_dir, verbose),
         Commands::List { limit } => cmd_invoices(&cfg_dir, limit),
+        Commands::Edit { invoice, item } => cmd_edit(&cfg_dir, &invoice, &item),
+        Commands::Open { invoice } => cmd_open(&cfg_dir, &invoice),
+        Commands::Regenerate { invoice } => cmd_regenerate(&cfg_dir, &invoice),
     }
 }
 
@@ -126,6 +152,43 @@ fn cmd_init(cfg_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+// Table row structs for tabled
+#[derive(Tabled)]
+struct ClientRow {
+    #[tabled(rename = "ID")]
+    id: String,
+    #[tabled(rename = "NAME")]
+    name: String,
+    #[tabled(rename = "EMAIL")]
+    email: String,
+}
+
+#[derive(Tabled)]
+struct ItemRow {
+    #[tabled(rename = "ID")]
+    id: String,
+    #[tabled(rename = "DESCRIPTION")]
+    description: String,
+    #[tabled(rename = "RATE")]
+    rate: String,
+    #[tabled(rename = "UNIT")]
+    unit: String,
+}
+
+#[derive(Tabled)]
+struct InvoiceRow {
+    #[tabled(rename = "#")]
+    index: usize,
+    #[tabled(rename = "NUMBER")]
+    number: String,
+    #[tabled(rename = "DATE")]
+    date: String,
+    #[tabled(rename = "TOTAL")]
+    total: String,
+    #[tabled(rename = "CLIENT")]
+    client: String,
+}
+
 /// List configured clients
 fn cmd_clients(cfg_dir: &PathBuf) -> Result<()> {
     if !cfg_dir.exists() {
@@ -140,15 +203,20 @@ fn cmd_clients(cfg_dir: &PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    println!("{:<20} {:<30} {}", "ID", "NAME", "EMAIL");
-    println!("{}", "-".repeat(70));
-
     let mut sorted: Vec<_> = clients.iter().collect();
     sorted.sort_by_key(|(k, _)| *k);
 
-    for (id, client) in sorted {
-        println!("{:<20} {:<30} {}", id, client.name, client.email);
-    }
+    let rows: Vec<ClientRow> = sorted
+        .iter()
+        .map(|(id, client)| ClientRow {
+            id: id.to_string(),
+            name: client.name.clone(),
+            email: client.email.clone(),
+        })
+        .collect();
+
+    let table = Table::new(rows).with(Style::rounded()).to_string();
+    println!("{table}");
 
     Ok(())
 }
@@ -168,25 +236,21 @@ fn cmd_items(cfg_dir: &PathBuf) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<20} {:<35} {:>10} {:>10}",
-        "ID", "DESCRIPTION", "RATE", "UNIT"
-    );
-    println!("{}", "-".repeat(80));
-
     let mut sorted: Vec<_> = items.iter().collect();
     sorted.sort_by_key(|(k, _)| *k);
 
-    for (id, item) in sorted {
-        println!(
-            "{:<20} {:<35} {:>9}{} {:>10}",
-            id,
-            truncate(&item.description, 35),
-            format!("{:.2}", item.rate),
-            config.invoice.currency_symbol,
-            format!("/{}", item.unit)
-        );
-    }
+    let rows: Vec<ItemRow> = sorted
+        .iter()
+        .map(|(id, item)| ItemRow {
+            id: id.to_string(),
+            description: item.description.clone(),
+            rate: format!("{:.2}{}", item.rate, config.invoice.currency_symbol),
+            unit: format!("/{}", item.unit),
+        })
+        .collect();
+
+    let table = Table::new(rows).with(Style::rounded()).to_string();
+    println!("{table}");
 
     Ok(())
 }
@@ -262,33 +326,57 @@ fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
         return Ok(());
     }
 
-    println!(
-        "{:<18} {:<12} {:>12} {}",
-        "NUMBER", "DATE", "TOTAL", "CLIENT"
-    );
-    println!("{}", "-".repeat(60));
-
-    let invoices: Vec<_> = state.history.iter().rev().collect();
+    let invoices: Vec<_> = state.history.iter().rev().enumerate().collect();
     let invoices = match limit {
         Some(n) => &invoices[..n.min(invoices.len())],
         None => &invoices[..],
     };
 
-    for entry in invoices {
-        println!(
-            "{:<18} {:<12} {:>11}{} {}",
-            entry.number,
-            entry.date,
-            format!("{:.2}", entry.total),
-            config.invoice.currency_symbol,
-            entry.client
-        );
-    }
+    let rows: Vec<InvoiceRow> = invoices
+        .iter()
+        .map(|(idx, entry)| InvoiceRow {
+            index: idx + 1,
+            number: entry.number.clone(),
+            date: entry.date.to_string(),
+            total: format!("{:.2}{}", entry.total, config.invoice.currency_symbol),
+            client: entry.client.clone(),
+        })
+        .collect();
+
+    let table = Table::new(rows).with(Style::rounded()).to_string();
+    println!("{table}");
 
     println!();
     println!("Total: {} invoices", state.history.len());
+    println!("Use index number with open/edit/regenerate (e.g., 'invoice open 1')");
 
     Ok(())
+}
+
+/// Resolve an invoice reference to the actual invoice number.
+/// Accepts either an index (1-based) from 'list' or the full invoice number.
+fn resolve_invoice_number(cfg_dir: &PathBuf, reference: &str) -> Result<String> {
+    let state = load_state(cfg_dir)?;
+
+    // Try to parse as an index first
+    if let Ok(idx) = reference.parse::<usize>() {
+        if idx == 0 {
+            return Err(InvoiceError::InvalidInvoiceIndex(reference.to_string()));
+        }
+        // Invoices are displayed in reverse order (newest first), 1-indexed
+        let invoices: Vec<_> = state.history.iter().rev().collect();
+        if idx > invoices.len() {
+            return Err(InvoiceError::InvalidInvoiceIndex(reference.to_string()));
+        }
+        return Ok(invoices[idx - 1].number.clone());
+    }
+
+    // Otherwise, treat as invoice number - verify it exists
+    if state.history.iter().any(|e| e.number == reference) {
+        Ok(reference.to_string())
+    } else {
+        Err(InvoiceError::InvoiceNotFound(reference.to_string()))
+    }
 }
 
 /// Generate a new invoice
@@ -318,13 +406,84 @@ fn format_invoice_number(format: &str, year: u32, seq: u32) -> String {
         .replace("{seq:03}", &format!("{:03}", seq))
 }
 
-/// Truncate string with ellipsis
-fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max {
-        s.to_string()
-    } else {
-        format!("{}...", &s[..max - 3])
+use chrono::Datelike;
+
+/// Edit an existing invoice
+fn cmd_edit(cfg_dir: &PathBuf, invoice_ref: &str, items: &[String]) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
     }
+
+    if items.is_empty() {
+        return Err(InvoiceError::NoItems);
+    }
+
+    let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
+    let config = load_config(cfg_dir)?;
+    let pdf_path = regenerate_invoice(cfg_dir, &invoice_number, Some(items))?;
+
+    println!("Updated {}", invoice_number);
+    println!("  Items:  {}", items.join(", "));
+    println!("  Saved:  {}", pdf_path.display());
+
+    // Show new total
+    let state = load_state(cfg_dir)?;
+    if let Some(entry) = state.history.iter().find(|e| e.number == invoice_number) {
+        println!("  Total:  {}{:.2}", config.invoice.currency_symbol, entry.total);
+    }
+
+    Ok(())
 }
 
-use chrono::Datelike;
+/// Open an invoice PDF
+fn cmd_open(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
+    let pdf_path = get_invoice_path(cfg_dir, &invoice_number)?;
+
+    // Open with system default viewer
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(&pdf_path)
+            .spawn()
+            .map_err(|e| InvoiceError::Io(e))?;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(&pdf_path)
+            .spawn()
+            .map_err(|e| InvoiceError::Io(e))?;
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        std::process::Command::new("cmd")
+            .args(["/C", "start", "", pdf_path.to_str().unwrap_or("")])
+            .spawn()
+            .map_err(|e| InvoiceError::Io(e))?;
+    }
+
+    println!("Opened {}", pdf_path.display());
+    Ok(())
+}
+
+/// Regenerate an invoice PDF
+fn cmd_regenerate(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
+    let pdf_path = regenerate_invoice(cfg_dir, &invoice_number, None)?;
+
+    println!("Regenerated {}", invoice_number);
+    println!("  Saved: {}", pdf_path.display());
+
+    Ok(())
+}
