@@ -30,6 +30,9 @@ pub struct HistoryEntry {
     pub date: NaiveDate,
     pub total: f64,
     pub file: String,
+    /// Original item inputs (e.g., ["consulting:8", "development:40"])
+    #[serde(default)]
+    pub items: Vec<String>,
 }
 
 use chrono::Datelike;

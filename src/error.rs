@@ -46,6 +46,18 @@ pub enum InvoiceError {
 
     #[error("Config directory already exists at {0}")]
     AlreadyInitialized(PathBuf),
+
+    #[error("Invoice '{0}' not found in history")]
+    InvoiceNotFound(String),
+
+    #[error("Invalid invoice index '{0}'. Use 'invoice list' to see available invoices.")]
+    InvalidInvoiceIndex(String),
+
+    #[error("Invoice '{0}' has no stored items (generated before item tracking was added)")]
+    NoStoredItems(String),
+
+    #[error("Invoice file not found: {0}")]
+    InvoiceFileNotFound(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, InvoiceError>;

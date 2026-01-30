@@ -13,7 +13,7 @@ use directories::ProjectDirs;
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// Global configuration from ~/.config/invoicing.toml
 #[derive(Debug, Deserialize, Default)]
@@ -78,6 +78,16 @@ pub fn expand_path(path: &str) -> PathBuf {
         }
     }
     PathBuf::from(path)
+}
+
+/// Resolve output_dir relative to cfg_dir if it's a relative path
+pub fn resolve_output_dir(output_dir: &str, cfg_dir: &Path) -> PathBuf {
+    let expanded = expand_path(output_dir);
+    if expanded.is_relative() {
+        cfg_dir.join(expanded)
+    } else {
+        expanded
+    }
 }
 
 /// Load the main config.toml
@@ -152,7 +162,7 @@ due_days = 30
 tax_rate = 0.0  # e.g., 0.0825 for 8.25%
 
 [pdf]
-output_dir = "~/.invoice/output"
+output_dir = "./output"
 "#;
 
 /// Template content for clients.toml
