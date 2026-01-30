@@ -60,7 +60,7 @@ enum Commands {
     },
 
     /// List generated invoices
-    Invoices {
+    List {
         /// Number of invoices to show (default: all)
         #[arg(short, long)]
         limit: Option<usize>,
@@ -91,7 +91,7 @@ fn run() -> Result<()> {
         Commands::Clients => cmd_clients(&cfg_dir),
         Commands::Items => cmd_items(&cfg_dir),
         Commands::Status { verbose } => cmd_status(&cfg_dir, verbose),
-        Commands::Invoices { limit } => cmd_invoices(&cfg_dir, limit),
+        Commands::List { limit } => cmd_invoices(&cfg_dir, limit),
     }
 }
 
