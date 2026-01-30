@@ -10,13 +10,47 @@ pub use state::{State, HistoryEntry};
 
 use crate::error::{InvoiceError, Result};
 use directories::ProjectDirs;
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs;
 use std::path::PathBuf;
 
-/// Get the config directory path (~/.invoice/)
+/// Global configuration from ~/.config/invoicing.toml
+#[derive(Debug, Deserialize, Default)]
+pub struct GlobalConfig {
+    /// Base directory containing config files (config.toml, clients.toml, etc.)
+    pub config_dir: Option<String>,
+}
+
+/// Path to the global config file
+fn global_config_path() -> Option<PathBuf> {
+    dirs_home().map(|h| h.join(".config").join("invoicing.toml"))
+}
+
+/// Load global config from ~/.config/invoicing.toml
+pub fn load_global_config() -> GlobalConfig {
+    if let Some(path) = global_config_path() {
+        if path.exists() {
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Ok(config) = toml::from_str(&content) {
+                    return config;
+                }
+            }
+        }
+    }
+    GlobalConfig::default()
+}
+
+/// Get the config directory path
+/// Priority: 1) CLI flag (-C), 2) ~/.config/invoicing.toml, 3) XDG/default
 pub fn config_dir() -> Result<PathBuf> {
-    // First try XDG-style directories
+    // Check global config first
+    let global = load_global_config();
+    if let Some(dir) = global.config_dir {
+        return Ok(expand_path(&dir));
+    }
+
+    // Try XDG-style directories
     if let Some(proj_dirs) = ProjectDirs::from("", "", "invoice") {
         return Ok(proj_dirs.config_dir().to_path_buf());
     }
@@ -161,3 +195,23 @@ description = "Project Setup & Configuration"
 rate = 500.00
 unit = "flat"   # fixed price, quantity is typically 1
 "#;
+
+/// Template content for global config (~/.config/invoicing.toml)
+#[allow(dead_code)]
+pub const GLOBAL_CONFIG_TEMPLATE: &str = r#"# Global invoice configuration
+# This file controls where the invoice CLI looks for its data files.
+#
+# If this file doesn't exist, the CLI uses:
+#   - macOS/Linux: ~/.config/invoice/ (XDG) or ~/.invoice/
+#
+# You can also override with the -C flag:
+#   invoice -C /path/to/config status
+
+# Base directory containing config.toml, clients.toml, items.toml, state.toml
+config_dir = "~/.invoice"
+"#;
+
+/// Get the global config file path for display
+pub fn global_config_file() -> PathBuf {
+    global_config_path().unwrap_or_else(|| PathBuf::from("~/.config/invoicing.toml"))
+}

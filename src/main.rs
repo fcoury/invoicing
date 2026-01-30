@@ -8,6 +8,7 @@ use std::path::PathBuf;
 
 use crate::config::{
     config_dir, load_clients, load_config, load_items, load_state,
+    load_global_config, global_config_file,
     CONFIG_TEMPLATE, CLIENTS_TEMPLATE, ITEMS_TEMPLATE,
 };
 use crate::error::{InvoiceError, Result};
@@ -52,7 +53,18 @@ enum Commands {
     Items,
 
     /// Show invoice status and next number
-    Status,
+    Status {
+        /// Show global config information
+        #[arg(short, long)]
+        verbose: bool,
+    },
+
+    /// List generated invoices
+    Invoices {
+        /// Number of invoices to show (default: all)
+        #[arg(short, long)]
+        limit: Option<usize>,
+    },
 }
 
 fn main() {
@@ -78,7 +90,8 @@ fn run() -> Result<()> {
         }
         Commands::Clients => cmd_clients(&cfg_dir),
         Commands::Items => cmd_items(&cfg_dir),
-        Commands::Status => cmd_status(&cfg_dir),
+        Commands::Status { verbose } => cmd_status(&cfg_dir, verbose),
+        Commands::Invoices { limit } => cmd_invoices(&cfg_dir, limit),
     }
 }
 
@@ -179,7 +192,7 @@ fn cmd_items(cfg_dir: &PathBuf) -> Result<()> {
 }
 
 /// Show invoice status
-fn cmd_status(cfg_dir: &PathBuf) -> Result<()> {
+fn cmd_status(cfg_dir: &PathBuf, show_global: bool) -> Result<()> {
     if !cfg_dir.exists() {
         return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
     }
@@ -200,7 +213,19 @@ fn cmd_status(cfg_dir: &PathBuf) -> Result<()> {
     let next_number = format_invoice_number(&config.invoice.number_format, current_year, next_seq);
 
     println!("Invoice Status");
-    println!("{}", "-".repeat(40));
+    println!("{}", "-".repeat(50));
+
+    // Show global config info if requested or if it exists
+    let global_path = global_config_file();
+    let global = load_global_config();
+    if show_global || global.config_dir.is_some() {
+        if global_path.exists() {
+            println!("Global config:    {} (active)", global_path.display());
+        } else {
+            println!("Global config:    {} (not found)", global_path.display());
+        }
+    }
+
     println!("Config directory: {}", cfg_dir.display());
     println!("Company:          {}", config.company.name);
     println!("Clients:          {}", clients.len());
@@ -219,6 +244,49 @@ fn cmd_status(cfg_dir: &PathBuf) -> Result<()> {
             );
         }
     }
+
+    Ok(())
+}
+
+/// List generated invoices
+fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    let config = load_config(cfg_dir)?;
+    let state = load_state(cfg_dir)?;
+
+    if state.history.is_empty() {
+        println!("No invoices generated yet.");
+        return Ok(());
+    }
+
+    println!(
+        "{:<18} {:<12} {:>12} {}",
+        "NUMBER", "DATE", "TOTAL", "CLIENT"
+    );
+    println!("{}", "-".repeat(60));
+
+    let invoices: Vec<_> = state.history.iter().rev().collect();
+    let invoices = match limit {
+        Some(n) => &invoices[..n.min(invoices.len())],
+        None => &invoices[..],
+    };
+
+    for entry in invoices {
+        println!(
+            "{:<18} {:<12} {:>11}{} {}",
+            entry.number,
+            entry.date,
+            format!("{:.2}", entry.total),
+            config.invoice.currency_symbol,
+            entry.client
+        );
+    }
+
+    println!();
+    println!("Total: {} invoices", state.history.len());
 
     Ok(())
 }
