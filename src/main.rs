@@ -189,6 +189,79 @@ struct InvoiceRow {
     client: String,
 }
 
+fn format_whole_money(value: f64, currency_symbol: &str) -> String {
+    let rounded = value.round() as i64;
+    let grouped = format_grouped_int(rounded);
+    format!("{}{:>6}", currency_symbol, grouped)
+}
+
+fn format_grouped_int(value: i64) -> String {
+    let negative = value < 0;
+    let digits = value.unsigned_abs().to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+
+    for (i, ch) in digits.chars().rev().enumerate() {
+        if i > 0 && i % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+
+    let mut grouped: String = out.chars().rev().collect();
+    if negative {
+        grouped.insert(0, '-');
+    }
+    grouped
+}
+
+fn add_total_footer(table: &str, total_amount: &str) -> String {
+    let lines: Vec<&str> = table.lines().collect();
+    if lines.len() < 4 {
+        return table.to_string();
+    }
+
+    let top = lines[0];
+    let Some(inner) = top.strip_prefix('╭').and_then(|s| s.strip_suffix('╮')) else {
+        return table.to_string();
+    };
+
+    let widths: Vec<usize> = inner.split('┬').map(|p| p.chars().count()).collect();
+    if widths.len() < 5 {
+        return table.to_string();
+    }
+
+    let left_width = widths[0] + widths[1] + widths[2] + 2;
+    let total_width = widths[3];
+    let client_width = widths[4];
+
+    let mut out = lines[..lines.len() - 1].join("\n");
+    out.push('\n');
+    out.push_str(&format!(
+        "├{}┴{}┴{}┼{}┼{}╯",
+        "─".repeat(widths[0]),
+        "─".repeat(widths[1]),
+        "─".repeat(widths[2]),
+        "─".repeat(total_width),
+        "─".repeat(client_width)
+    ));
+    out.push('\n');
+    out.push_str(&format!(
+        "│ {:>left$} │ {:>total$} │",
+        "TOTAL",
+        total_amount,
+        left = left_width - 2,
+        total = total_width - 2
+    ));
+    out.push('\n');
+    out.push_str(&format!(
+        "╰{}┴{}╯",
+        "─".repeat(left_width),
+        "─".repeat(total_width)
+    ));
+
+    out
+}
+
 /// List configured clients
 fn cmd_clients(cfg_dir: &PathBuf) -> Result<()> {
     if !cfg_dir.exists() {
@@ -338,12 +411,17 @@ fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
             index: idx + 1,
             number: entry.number.clone(),
             date: entry.date.to_string(),
-            total: format!("{:.2}{}", entry.total, config.invoice.currency_symbol),
+            total: format_whole_money(entry.total, &config.invoice.currency_symbol),
             client: entry.client.clone(),
         })
         .collect();
 
+    let shown_total: f64 = invoices.iter().map(|(_, entry)| entry.total).sum();
+
     let table = Table::new(rows).with(Style::rounded()).to_string();
+    let total_amount = format_whole_money(shown_total, &config.invoice.currency_symbol);
+    let table = add_total_footer(&table, &total_amount);
+
     println!("{table}");
 
     println!();
