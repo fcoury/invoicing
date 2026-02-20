@@ -45,6 +45,10 @@ enum Commands {
         /// Custom output file path (default: output_dir/INV-XXXX.pdf)
         #[arg(short, long)]
         output: Option<PathBuf>,
+
+        /// Open generated PDF with system default viewer
+        #[arg(long)]
+        open: bool,
     },
 
     /// List configured clients
@@ -87,6 +91,10 @@ enum Commands {
     Regenerate {
         /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
         invoice: String,
+
+        /// Open regenerated PDF with system default viewer
+        #[arg(long)]
+        open: bool,
     },
 }
 
@@ -108,8 +116,13 @@ fn run() -> Result<()> {
 
     match cli.command {
         Commands::Init => cmd_init(&cfg_dir),
-        Commands::Generate { client, item, output } => {
-            cmd_generate(&cfg_dir, &client, &item, output)
+        Commands::Generate {
+            client,
+            item,
+            output,
+            open,
+        } => {
+            cmd_generate(&cfg_dir, &client, &item, output, open)
         }
         Commands::Clients => cmd_clients(&cfg_dir),
         Commands::Items => cmd_items(&cfg_dir),
@@ -117,7 +130,7 @@ fn run() -> Result<()> {
         Commands::List { limit } => cmd_invoices(&cfg_dir, limit),
         Commands::Edit { invoice, item } => cmd_edit(&cfg_dir, &invoice, &item),
         Commands::Open { invoice } => cmd_open(&cfg_dir, &invoice),
-        Commands::Regenerate { invoice } => cmd_regenerate(&cfg_dir, &invoice),
+        Commands::Regenerate { invoice, open } => cmd_regenerate(&cfg_dir, &invoice, open),
     }
 }
 
@@ -463,6 +476,7 @@ fn cmd_generate(
     client_id: &str,
     items_input: &[String],
     output: Option<PathBuf>,
+    open: bool,
 ) -> Result<()> {
     if !cfg_dir.exists() {
         return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
@@ -472,7 +486,23 @@ fn cmd_generate(
         return Err(InvoiceError::NoItems);
     }
 
-    generate_invoice(cfg_dir, client_id, items_input, output)
+    let output_path = output.clone();
+    generate_invoice(cfg_dir, client_id, items_input, output)?;
+    if open {
+        let pdf_path = if let Some(path) = output_path {
+            path
+        } else {
+            let state = load_state(cfg_dir)?;
+            let invoice_number = state
+                .history
+                .last()
+                .map(|entry| entry.number.clone())
+                .ok_or_else(|| InvoiceError::InvoiceNotFound("latest".to_string()))?;
+            get_invoice_path(cfg_dir, &invoice_number)?
+        };
+        open_path(&pdf_path)?;
+    }
+    Ok(())
 }
 
 /// Format invoice number from template
@@ -522,6 +552,13 @@ fn cmd_open(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
     let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
     let pdf_path = get_invoice_path(cfg_dir, &invoice_number)?;
 
+    open_path(&pdf_path)?;
+
+    println!("Opened {}", pdf_path.display());
+    Ok(())
+}
+
+fn open_path(pdf_path: &PathBuf) -> Result<()> {
     // Open with system default viewer
     #[cfg(target_os = "macos")]
     {
@@ -546,19 +583,20 @@ fn cmd_open(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
             .spawn()
             .map_err(|e| InvoiceError::Io(e))?;
     }
-
-    println!("Opened {}", pdf_path.display());
     Ok(())
 }
 
 /// Regenerate an invoice PDF
-fn cmd_regenerate(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
+fn cmd_regenerate(cfg_dir: &PathBuf, invoice_ref: &str, open: bool) -> Result<()> {
     if !cfg_dir.exists() {
         return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
     }
 
     let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
     let pdf_path = regenerate_invoice(cfg_dir, &invoice_number, None)?;
+    if open {
+        open_path(&pdf_path)?;
+    }
 
     println!("Regenerated {}", invoice_number);
     println!("  Saved: {}", pdf_path.display());
