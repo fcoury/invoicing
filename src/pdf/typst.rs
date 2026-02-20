@@ -18,6 +18,26 @@ const INVOICE_TEMPLATE: &str = r##"// Invoice Template
 
 #set text(font: "Helvetica", size: 10pt)
 
+#let fmt-int(digits) = {
+  let len = digits.len()
+  let out = ""
+  for (i, digit) in digits.clusters().enumerate() {
+    if i > 0 and calc.rem(len - i, 3) == 0 {
+      out += ","
+    }
+    out += digit
+  }
+  out
+}
+
+#let fmt-currency(amount) = {
+  let parts = str(calc.round(amount, digits: 2)).split(".")
+  let whole = fmt-int(parts.at(0))
+  let frac = if parts.len() > 1 { parts.at(1) } else { "00" }
+  let frac2 = if frac.len() == 1 { frac + "0" } else { frac }
+  data.currency_symbol + whole + "." + frac2
+}
+
 // Header with company info and invoice details
 #grid(
   columns: (1fr, 1fr),
@@ -85,9 +105,9 @@ const INVOICE_TEMPLATE: &str = r##"// Invoice Template
   ..data.items.enumerate().map(((i, item)) => (
     str(i + 1),
     item.description,
-    [#item.quantity #item.unit],
-    [#data.currency_symbol#str(calc.round(item.rate, digits: 2))],
-    [#data.currency_symbol#str(calc.round(item.amount, digits: 2))],
+    [#item.quantity #if item.quantity == 1 { item.unit } else { item.unit + "s" }],
+    [#fmt-currency(item.rate)],
+    [#fmt-currency(item.amount)],
   )).flatten()
 )
 
@@ -101,16 +121,16 @@ const INVOICE_TEMPLATE: &str = r##"// Invoice Template
     align: (right, right),
     inset: 6pt,
 
-    [Subtotal:], [#data.currency_symbol#str(calc.round(data.subtotal, digits: 2))],
+    [Subtotal:], [#fmt-currency(data.subtotal)],
 
     ..if data.tax_rate > 0 {
-      ([Tax (#str(calc.round(data.tax_rate, digits: 2))%):], [#data.currency_symbol#str(calc.round(data.tax_amount, digits: 2))])
+      ([Tax (#str(calc.round(data.tax_rate, digits: 2))%):], [#fmt-currency(data.tax_amount)])
     } else {
       ()
     },
 
     table.hline(stroke: 1pt),
-    [*Total:*], [*#data.currency_symbol#str(calc.round(data.total, digits: 2))*],
+    [*Total:*], [*#fmt-currency(data.total)*],
   )
 ]
 
