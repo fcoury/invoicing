@@ -12,7 +12,8 @@ use crate::config::{
     load_state, save_state, CLIENTS_TEMPLATE, CONFIG_TEMPLATE, ITEMS_TEMPLATE,
 };
 use crate::error::{InvoiceError, Result};
-use crate::invoice::{generate_invoice, get_invoice_path, regenerate_invoice};
+use crate::invoice::{generate_invoice, get_invoice_path, regenerate_invoice, ReportData, ReportInvoiceRow};
+use crate::pdf::generate_report_pdf;
 
 #[derive(Parser)]
 #[command(name = "invoice")]
@@ -107,6 +108,29 @@ enum Commands {
         /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
         invoice: String,
     },
+
+    /// Generate a PDF report of invoices for a client
+    Report {
+        /// Client identifier from clients.toml
+        #[arg(short, long)]
+        client: String,
+
+        /// Filter invoices from this date (YYYY-MM-DD)
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Filter invoices to this date (YYYY-MM-DD)
+        #[arg(long)]
+        to: Option<String>,
+
+        /// Filter by payment status
+        #[arg(long)]
+        status: Option<String>,
+
+        /// Open generated PDF with system default viewer
+        #[arg(long)]
+        open: bool,
+    },
 }
 
 fn main() {
@@ -142,6 +166,13 @@ fn run() -> Result<()> {
         Commands::Regenerate { invoice, open } => cmd_regenerate(&cfg_dir, &invoice, open),
         Commands::MarkPaid { invoice } => cmd_mark_paid(&cfg_dir, &invoice),
         Commands::MarkUnpaid { invoice } => cmd_mark_unpaid(&cfg_dir, &invoice),
+        Commands::Report {
+            client,
+            from,
+            to,
+            status,
+            open,
+        } => cmd_report(&cfg_dir, &client, from, to, status, open),
     }
 }
 
@@ -442,6 +473,30 @@ fn cmd_status(cfg_dir: &PathBuf, show_global: bool) -> Result<()> {
     Ok(())
 }
 
+/// Fetch the current USD→BRL exchange rate from the Frankfurter API.
+/// Returns None on any failure (network, timeout, parse error) so the
+/// caller can silently skip the BRL line.
+fn fetch_usd_to_brl_rate() -> Option<f64> {
+    use std::time::Duration;
+    use ureq::Agent;
+
+    let agent: Agent = Agent::config_builder()
+        .timeout_global(Some(Duration::from_secs(3)))
+        .build()
+        .into();
+
+    let body: String = agent
+        .get("https://api.frankfurter.dev/v1/latest?base=USD&symbols=BRL")
+        .call()
+        .ok()?
+        .body_mut()
+        .read_to_string()
+        .ok()?;
+
+    let json: serde_json::Value = serde_json::from_str(&body).ok()?;
+    json["rates"]["BRL"].as_f64()
+}
+
 /// List generated invoices
 fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
     if !cfg_dir.exists() {
@@ -500,6 +555,19 @@ fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
 
     println!();
     println!("Total: {} invoices", state.history.len());
+
+    // Show outstanding amount converted to BRL if there's an outstanding balance
+    if shown_outstanding > 0.0 {
+        if let Some(rate) = fetch_usd_to_brl_rate() {
+            let brl_amount = (shown_outstanding * rate).round() as i64;
+            println!(
+                "Outstanding in BRL: R$ {} (1 USD = {:.2} BRL)",
+                format_grouped_int(brl_amount),
+                rate
+            );
+        }
+    }
+
     println!(
         "Use index number with open/edit/regenerate/mark-paid/mark-unpaid (e.g., 'invoice open 1')"
     );
@@ -668,6 +736,157 @@ fn cmd_regenerate(cfg_dir: &PathBuf, invoice_ref: &str, open: bool) -> Result<()
     println!("  Saved: {}", pdf_path.display());
 
     Ok(())
+}
+
+/// Generate a PDF report of invoices for a client
+fn cmd_report(
+    cfg_dir: &PathBuf,
+    client_id: &str,
+    from: Option<String>,
+    to: Option<String>,
+    status: Option<String>,
+    open: bool,
+) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    let config = load_config(cfg_dir)?;
+    let clients = load_clients(cfg_dir)?;
+    let state = load_state(cfg_dir)?;
+
+    // Validate client exists
+    let client = clients
+        .get(client_id)
+        .ok_or_else(|| InvoiceError::ClientNotFound(client_id.to_string()))?
+        .clone();
+
+    // Parse date filters
+    let from_date = from
+        .as_ref()
+        .map(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|_| InvoiceError::PdfGeneration(format!("Invalid --from date: {s}")))
+        })
+        .transpose()?;
+    let to_date = to
+        .as_ref()
+        .map(|s| {
+            chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                .map_err(|_| InvoiceError::PdfGeneration(format!("Invalid --to date: {s}")))
+        })
+        .transpose()?;
+
+    // Validate status filter
+    if let Some(ref s) = status {
+        if s != "paid" && s != "unpaid" {
+            return Err(InvoiceError::PdfGeneration(format!(
+                "Invalid --status value: '{s}'. Use 'paid' or 'unpaid'."
+            )));
+        }
+    }
+
+    // Filter history entries for this client
+    let filtered: Vec<_> = state
+        .history
+        .iter()
+        .filter(|e| e.client == client_id)
+        .filter(|e| from_date.map_or(true, |d| e.date >= d))
+        .filter(|e| to_date.map_or(true, |d| e.date <= d))
+        .filter(|e| match status.as_deref() {
+            Some("paid") => e.paid,
+            Some("unpaid") => !e.paid,
+            _ => true,
+        })
+        .collect();
+
+    if filtered.is_empty() {
+        println!("No invoices found for client '{client_id}' with the given filters.");
+        return Ok(());
+    }
+
+    // Build report rows
+    let rows: Vec<ReportInvoiceRow> = filtered
+        .iter()
+        .map(|e| ReportInvoiceRow {
+            number: e.number.clone(),
+            date: e.date.format("%B %d, %Y").to_string(),
+            total: e.total,
+            status: if e.paid {
+                "PAID".to_string()
+            } else {
+                "UNPAID".to_string()
+            },
+        })
+        .collect();
+
+    // Calculate financial summary
+    let total: f64 = filtered.iter().map(|e| e.total).sum();
+    let paid: f64 = filtered.iter().filter(|e| e.paid).map(|e| e.total).sum();
+    let outstanding = total - paid;
+
+    let today = chrono::Local::now().format("%B %d, %Y").to_string();
+
+    let report_data = ReportData {
+        company: config.company.clone(),
+        client,
+        client_id: client_id.to_string(),
+        rows,
+        total,
+        paid,
+        outstanding,
+        currency_symbol: config.invoice.currency_symbol.clone(),
+        generated_date: today,
+        filter_from: from.clone(),
+        filter_to: to.clone(),
+        filter_status: status.clone(),
+    };
+
+    // Determine output path
+    let output_dir = config::resolve_output_dir(&config.pdf.output_dir, cfg_dir);
+    std::fs::create_dir_all(&output_dir)?;
+
+    let today_str = chrono::Local::now().format("%Y-%m-%d").to_string();
+    let pdf_filename = format!("REPORT-{}-{}.pdf", client_id, today_str);
+    let pdf_path = output_dir.join(&pdf_filename);
+
+    // Generate PDF
+    generate_report_pdf(&report_data, &pdf_path)?;
+
+    // Print summary
+    println!("Generated report for '{}'", client_id);
+    println!("  Invoices: {}", filtered.len());
+    println!(
+        "  Total:    {}{}",
+        config.invoice.currency_symbol,
+        format_report_amount(total)
+    );
+    println!("  Saved:    {}", pdf_path.display());
+
+    if open {
+        open_path(&pdf_path)?;
+    }
+
+    Ok(())
+}
+
+/// Format a money amount with two decimal places and thousands separators
+fn format_report_amount(value: f64) -> String {
+    let rounded = format!("{:.2}", value);
+    let parts: Vec<&str> = rounded.split('.').collect();
+    let whole = parts[0];
+    let frac = parts[1];
+
+    // Group digits in the whole part
+    let negative = whole.starts_with('-');
+    let digits = if negative { &whole[1..] } else { whole };
+    let grouped = format_grouped_int(digits.parse::<i64>().unwrap_or(0));
+
+    if negative {
+        format!("-{}.{}", grouped, frac)
+    } else {
+        format!("{}.{}", grouped, frac)
+    }
 }
 
 fn set_invoice_payment_status(cfg_dir: &PathBuf, invoice_ref: &str, paid: bool) -> Result<String> {
