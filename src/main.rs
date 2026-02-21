@@ -5,12 +5,11 @@ mod pdf;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
-use tabled::{Table, Tabled, settings::Style};
+use tabled::{settings::Style, Table, Tabled};
 
 use crate::config::{
-    config_dir, load_clients, load_config, load_items, load_state,
-    load_global_config, global_config_file,
-    CONFIG_TEMPLATE, CLIENTS_TEMPLATE, ITEMS_TEMPLATE,
+    config_dir, global_config_file, load_clients, load_config, load_global_config, load_items,
+    load_state, save_state, CLIENTS_TEMPLATE, CONFIG_TEMPLATE, ITEMS_TEMPLATE,
 };
 use crate::error::{InvoiceError, Result};
 use crate::invoice::{generate_invoice, get_invoice_path, regenerate_invoice};
@@ -96,6 +95,18 @@ enum Commands {
         #[arg(long)]
         open: bool,
     },
+
+    /// Mark an invoice as paid
+    MarkPaid {
+        /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
+        invoice: String,
+    },
+
+    /// Mark an invoice as unpaid
+    MarkUnpaid {
+        /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
+        invoice: String,
+    },
 }
 
 fn main() {
@@ -121,9 +132,7 @@ fn run() -> Result<()> {
             item,
             output,
             open,
-        } => {
-            cmd_generate(&cfg_dir, &client, &item, output, open)
-        }
+        } => cmd_generate(&cfg_dir, &client, &item, output, open),
         Commands::Clients => cmd_clients(&cfg_dir),
         Commands::Items => cmd_items(&cfg_dir),
         Commands::Status { verbose } => cmd_status(&cfg_dir, verbose),
@@ -131,6 +140,8 @@ fn run() -> Result<()> {
         Commands::Edit { invoice, item } => cmd_edit(&cfg_dir, &invoice, &item),
         Commands::Open { invoice } => cmd_open(&cfg_dir, &invoice),
         Commands::Regenerate { invoice, open } => cmd_regenerate(&cfg_dir, &invoice, open),
+        Commands::MarkPaid { invoice } => cmd_mark_paid(&cfg_dir, &invoice),
+        Commands::MarkUnpaid { invoice } => cmd_mark_unpaid(&cfg_dir, &invoice),
     }
 }
 
@@ -155,9 +166,18 @@ fn cmd_init(cfg_dir: &PathBuf) -> Result<()> {
     println!("Initialized invoice config at: {}", cfg_dir.display());
     println!();
     println!("Next steps:");
-    println!("  1. Edit your company details:  $EDITOR {}/config.toml", cfg_dir.display());
-    println!("  2. Add your clients:           $EDITOR {}/clients.toml", cfg_dir.display());
-    println!("  3. Configure line items:       $EDITOR {}/items.toml", cfg_dir.display());
+    println!(
+        "  1. Edit your company details:  $EDITOR {}/config.toml",
+        cfg_dir.display()
+    );
+    println!(
+        "  2. Add your clients:           $EDITOR {}/clients.toml",
+        cfg_dir.display()
+    );
+    println!(
+        "  3. Configure line items:       $EDITOR {}/items.toml",
+        cfg_dir.display()
+    );
     println!();
     println!("Then generate your first invoice:");
     println!("  invoice generate --client <client-id> --item <item>:<quantity>");
@@ -198,6 +218,8 @@ struct InvoiceRow {
     date: String,
     #[tabled(rename = "TOTAL")]
     total: String,
+    #[tabled(rename = "STATUS")]
+    status: String,
     #[tabled(rename = "CLIENT")]
     client: String,
 }
@@ -227,45 +249,69 @@ fn format_grouped_int(value: i64) -> String {
     grouped
 }
 
-fn add_total_footer(table: &str, total_amount: &str) -> String {
+fn add_financial_footer(table: &str, total: &str, paid: &str, outstanding: &str) -> String {
     let lines: Vec<&str> = table.lines().collect();
     if lines.len() < 4 {
         return table.to_string();
     }
 
+    // Parse the top border to discover column widths
     let top = lines[0];
     let Some(inner) = top.strip_prefix('╭').and_then(|s| s.strip_suffix('╮')) else {
         return table.to_string();
     };
 
     let widths: Vec<usize> = inner.split('┬').map(|p| p.chars().count()).collect();
-    if widths.len() < 5 {
+    if widths.len() < 6 {
         return table.to_string();
     }
 
-    let left_width = widths[0] + widths[1] + widths[2] + 2;
+    // Merge columns #, NUMBER, DATE into one label cell; keep TOTAL column; drop STATUS and CLIENT
+    let left_width = widths[0] + widths[1] + widths[2] + 2; // +2 for the two ┴ replaced by spaces
     let total_width = widths[3];
-    let client_width = widths[4];
+    let status_width = widths[4];
+    let client_width = widths[5];
 
+    let rows = [
+        ("TOTAL", total),
+        ("(-) PAID", paid),
+        ("(=) OUTSTANDING", outstanding),
+    ];
+
+    // Strip the original bottom border and start building
     let mut out = lines[..lines.len() - 1].join("\n");
     out.push('\n');
+
+    // First separator: merge left 3 columns, keep TOTAL, close off STATUS+CLIENT
     out.push_str(&format!(
-        "├{}┴{}┴{}┼{}┼{}╯",
+        "├{}┴{}┴{}┼{}┼{}┴{}╯\n",
         "─".repeat(widths[0]),
         "─".repeat(widths[1]),
         "─".repeat(widths[2]),
         "─".repeat(total_width),
-        "─".repeat(client_width)
+        "─".repeat(status_width),
+        "─".repeat(client_width),
     ));
-    out.push('\n');
-    out.push_str(&format!(
-        "│ {:>left$} │ {:>total$} │",
-        "TOTAL",
-        total_amount,
-        left = left_width - 2,
-        total = total_width - 2
-    ));
-    out.push('\n');
+
+    // Summary rows with separators between them
+    for (idx, (label, value)) in rows.iter().enumerate() {
+        out.push_str(&format!(
+            "│ {:>left$} │ {:>total$} │\n",
+            label,
+            value,
+            left = left_width - 2,
+            total = total_width - 2
+        ));
+        if idx < rows.len() - 1 {
+            out.push_str(&format!(
+                "├{}┼{}┤\n",
+                "─".repeat(left_width),
+                "─".repeat(total_width)
+            ));
+        }
+    }
+
+    // Bottom border
     out.push_str(&format!(
         "╰{}┴{}╯",
         "─".repeat(left_width),
@@ -386,11 +432,9 @@ fn cmd_status(cfg_dir: &PathBuf, show_global: bool) -> Result<()> {
         println!();
         println!("Recent invoices:");
         for entry in state.history.iter().rev().take(5) {
-            println!("  {} - {} - {}{:.2}",
-                entry.number,
-                entry.client,
-                config.invoice.currency_symbol,
-                entry.total
+            println!(
+                "  {} - {} - {}{:.2}",
+                entry.number, entry.client, config.invoice.currency_symbol, entry.total
             );
         }
     }
@@ -425,21 +469,40 @@ fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
             number: entry.number.clone(),
             date: entry.date.to_string(),
             total: format_whole_money(entry.total, &config.invoice.currency_symbol),
+            status: if entry.paid {
+                "PAID".to_string()
+            } else {
+                "UNPAID".to_string()
+            },
             client: entry.client.clone(),
         })
         .collect();
 
     let shown_total: f64 = invoices.iter().map(|(_, entry)| entry.total).sum();
+    let shown_paid: f64 = invoices
+        .iter()
+        .filter(|(_, entry)| entry.paid)
+        .map(|(_, entry)| entry.total)
+        .sum();
+    let shown_outstanding: f64 = invoices
+        .iter()
+        .filter(|(_, entry)| !entry.paid)
+        .map(|(_, entry)| entry.total)
+        .sum();
 
     let table = Table::new(rows).with(Style::rounded()).to_string();
     let total_amount = format_whole_money(shown_total, &config.invoice.currency_symbol);
-    let table = add_total_footer(&table, &total_amount);
+    let paid_amount = format_whole_money(shown_paid, &config.invoice.currency_symbol);
+    let outstanding_amount = format_whole_money(shown_outstanding, &config.invoice.currency_symbol);
+    let table = add_financial_footer(&table, &total_amount, &paid_amount, &outstanding_amount);
 
     println!("{table}");
 
     println!();
     println!("Total: {} invoices", state.history.len());
-    println!("Use index number with open/edit/regenerate (e.g., 'invoice open 1')");
+    println!(
+        "Use index number with open/edit/regenerate/mark-paid/mark-unpaid (e.g., 'invoice open 1')"
+    );
 
     Ok(())
 }
@@ -537,7 +600,10 @@ fn cmd_edit(cfg_dir: &PathBuf, invoice_ref: &str, items: &[String]) -> Result<()
     // Show new total
     let state = load_state(cfg_dir)?;
     if let Some(entry) = state.history.iter().find(|e| e.number == invoice_number) {
-        println!("  Total:  {}{:.2}", config.invoice.currency_symbol, entry.total);
+        println!(
+            "  Total:  {}{:.2}",
+            config.invoice.currency_symbol, entry.total
+        );
     }
 
     Ok(())
@@ -601,5 +667,38 @@ fn cmd_regenerate(cfg_dir: &PathBuf, invoice_ref: &str, open: bool) -> Result<()
     println!("Regenerated {}", invoice_number);
     println!("  Saved: {}", pdf_path.display());
 
+    Ok(())
+}
+
+fn set_invoice_payment_status(cfg_dir: &PathBuf, invoice_ref: &str, paid: bool) -> Result<String> {
+    let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
+    let mut state = load_state(cfg_dir)?;
+    let entry = state
+        .history
+        .iter_mut()
+        .find(|entry| entry.number == invoice_number)
+        .ok_or_else(|| InvoiceError::InvoiceNotFound(invoice_number.clone()))?;
+    entry.paid = paid;
+    save_state(cfg_dir, &state)?;
+    Ok(invoice_number)
+}
+
+fn cmd_mark_paid(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    let invoice_number = set_invoice_payment_status(cfg_dir, invoice_ref, true)?;
+    println!("Marked {} as paid", invoice_number);
+    Ok(())
+}
+
+fn cmd_mark_unpaid(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    let invoice_number = set_invoice_payment_status(cfg_dir, invoice_ref, false)?;
+    println!("Marked {} as unpaid", invoice_number);
     Ok(())
 }

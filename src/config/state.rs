@@ -30,6 +30,8 @@ pub struct HistoryEntry {
     pub date: NaiveDate,
     pub total: f64,
     pub file: String,
+    #[serde(default)]
+    pub paid: bool,
     /// Original item inputs (e.g., ["consulting:8", "development:40"])
     #[serde(default)]
     pub items: Vec<String>,

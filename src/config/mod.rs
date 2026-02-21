@@ -1,12 +1,12 @@
-mod company;
 mod client;
+mod company;
 mod item;
 mod state;
 
-pub use company::{Company, Config};
 pub use client::Client;
+pub use company::{Company, Config};
 pub use item::Item;
-pub use state::{State, HistoryEntry};
+pub use state::{HistoryEntry, State};
 
 use crate::error::{InvoiceError, Result};
 use directories::ProjectDirs;
@@ -133,11 +133,12 @@ pub fn load_state(config_dir: &PathBuf) -> Result<State> {
 /// Save state.toml
 pub fn save_state(config_dir: &PathBuf, state: &State) -> Result<()> {
     let path = config_dir.join("state.toml");
-    let content = toml::to_string_pretty(state)
-        .map_err(|e| InvoiceError::Io(std::io::Error::new(
+    let content = toml::to_string_pretty(state).map_err(|e| {
+        InvoiceError::Io(std::io::Error::new(
             std::io::ErrorKind::InvalidData,
             e.to_string(),
-        )))?;
+        ))
+    })?;
     fs::write(path, content)?;
     Ok(())
 }

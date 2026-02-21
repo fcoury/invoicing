@@ -1,10 +1,10 @@
-use std::path::PathBuf;
 use chrono::{Datelike, Local, NaiveDate};
 use serde::Serialize;
+use std::path::PathBuf;
 
 use crate::config::{
-    load_clients, load_config, load_items, load_state, resolve_output_dir, save_state,
-    Client, Company, HistoryEntry,
+    load_clients, load_config, load_items, load_state, resolve_output_dir, save_state, Client,
+    Company, HistoryEntry,
 };
 use crate::error::{InvoiceError, Result};
 use crate::pdf::generate_pdf;
@@ -302,13 +302,10 @@ pub fn generate_invoice(
     state.history.push(HistoryEntry {
         number: invoice_number.clone(),
         client: client_id.to_string(),
-        date: NaiveDate::from_ymd_opt(
-            today.year(),
-            today.month(),
-            today.day(),
-        ).unwrap(),
+        date: NaiveDate::from_ymd_opt(today.year(), today.month(), today.day()).unwrap(),
         total,
         file: pdf_filename,
+        paid: false,
         items: items_input.to_vec(),
     });
 
