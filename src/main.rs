@@ -3,16 +3,21 @@ mod error;
 mod invoice;
 mod pdf;
 
+use chrono::Datelike;
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tabled::{settings::Style, Table, Tabled};
 
 use crate::config::{
     config_dir, global_config_file, load_clients, load_config, load_global_config, load_items,
-    load_state, save_state, CLIENTS_TEMPLATE, CONFIG_TEMPLATE, ITEMS_TEMPLATE,
+    load_state, save_state,
+    state::{Payment, PaymentStatus},
+    CLIENTS_TEMPLATE, CONFIG_TEMPLATE, ITEMS_TEMPLATE,
 };
 use crate::error::{InvoiceError, Result};
-use crate::invoice::{generate_invoice, get_invoice_path, regenerate_invoice, ReportData, ReportInvoiceRow};
+use crate::invoice::{
+    generate_invoice, get_invoice_path, regenerate_invoice, ReportData, ReportInvoiceRow,
+};
 use crate::pdf::generate_report_pdf;
 
 #[derive(Parser)]
@@ -97,15 +102,32 @@ enum Commands {
         open: bool,
     },
 
-    /// Mark an invoice as paid
-    MarkPaid {
-        /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
+    /// Record a payment against an invoice
+    AddPayment {
+        /// Invoice number or index from 'list' (e.g., 1 or INV-2026-0001)
         invoice: String,
+
+        /// Payment amount
+        amount: f64,
+
+        /// Payment date (default: today)
+        #[arg(long)]
+        date: Option<String>,
     },
 
-    /// Mark an invoice as unpaid
-    MarkUnpaid {
-        /// Invoice number or index from 'list' (e.g., 1 or INV-2025-0001)
+    /// Remove a payment from an invoice
+    RemovePayment {
+        /// Invoice number or index from 'list' (e.g., 1 or INV-2026-0001)
+        invoice: String,
+
+        /// 1-based index of payment to remove (default: last)
+        #[arg(long)]
+        index: Option<usize>,
+    },
+
+    /// Show payment history for an invoice
+    Payments {
+        /// Invoice number or index from 'list' (e.g., 1 or INV-2026-0001)
         invoice: String,
     },
 
@@ -123,7 +145,7 @@ enum Commands {
         #[arg(long)]
         to: Option<String>,
 
-        /// Filter by payment status
+        /// Filter by payment status (paid, unpaid, partial)
         #[arg(long)]
         status: Option<String>,
 
@@ -164,8 +186,15 @@ fn run() -> Result<()> {
         Commands::Edit { invoice, item } => cmd_edit(&cfg_dir, &invoice, &item),
         Commands::Open { invoice } => cmd_open(&cfg_dir, &invoice),
         Commands::Regenerate { invoice, open } => cmd_regenerate(&cfg_dir, &invoice, open),
-        Commands::MarkPaid { invoice } => cmd_mark_paid(&cfg_dir, &invoice),
-        Commands::MarkUnpaid { invoice } => cmd_mark_unpaid(&cfg_dir, &invoice),
+        Commands::AddPayment {
+            invoice,
+            amount,
+            date,
+        } => cmd_add_payment(&cfg_dir, &invoice, amount, date),
+        Commands::RemovePayment { invoice, index } => {
+            cmd_remove_payment(&cfg_dir, &invoice, index)
+        }
+        Commands::Payments { invoice } => cmd_payments(&cfg_dir, &invoice),
         Commands::Report {
             client,
             from,
@@ -253,6 +282,16 @@ struct InvoiceRow {
     status: String,
     #[tabled(rename = "CLIENT")]
     client: String,
+}
+
+#[derive(Tabled)]
+struct PaymentRow {
+    #[tabled(rename = "#")]
+    index: usize,
+    #[tabled(rename = "DATE")]
+    date: String,
+    #[tabled(rename = "AMOUNT")]
+    amount: String,
 }
 
 fn format_whole_money(value: f64, currency_symbol: &str) -> String {
@@ -497,7 +536,7 @@ fn fetch_usd_to_brl_rate() -> Option<f64> {
     json["rates"]["BRL"].as_f64()
 }
 
-/// List generated invoices
+/// List generated invoices with three-way status (UNPAID / PARTIAL / PAID)
 fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
     if !cfg_dir.exists() {
         return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
@@ -517,6 +556,7 @@ fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
         None => &invoices[..],
     };
 
+    // Derive status from payment records
     let rows: Vec<InvoiceRow> = invoices
         .iter()
         .map(|(idx, entry)| InvoiceRow {
@@ -524,26 +564,15 @@ fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
             number: entry.number.clone(),
             date: entry.date.to_string(),
             total: format_whole_money(entry.total, &config.invoice.currency_symbol),
-            status: if entry.paid {
-                "PAID".to_string()
-            } else {
-                "UNPAID".to_string()
-            },
+            status: entry.status().to_string(),
             client: entry.client.clone(),
         })
         .collect();
 
+    // Financial summary uses actual payment amounts
     let shown_total: f64 = invoices.iter().map(|(_, entry)| entry.total).sum();
-    let shown_paid: f64 = invoices
-        .iter()
-        .filter(|(_, entry)| entry.paid)
-        .map(|(_, entry)| entry.total)
-        .sum();
-    let shown_outstanding: f64 = invoices
-        .iter()
-        .filter(|(_, entry)| !entry.paid)
-        .map(|(_, entry)| entry.total)
-        .sum();
+    let shown_paid: f64 = invoices.iter().map(|(_, entry)| entry.paid_amount()).sum();
+    let shown_outstanding: f64 = shown_total - shown_paid;
 
     let table = Table::new(rows).with(Style::rounded()).to_string();
     let total_amount = format_whole_money(shown_total, &config.invoice.currency_symbol);
@@ -569,7 +598,7 @@ fn cmd_invoices(cfg_dir: &PathBuf, limit: Option<usize>) -> Result<()> {
     }
 
     println!(
-        "Use index number with open/edit/regenerate/mark-paid/mark-unpaid (e.g., 'invoice open 1')"
+        "Use index number with open/edit/regenerate/add-payment/remove-payment (e.g., 'invoice open 1')"
     );
 
     Ok(())
@@ -644,8 +673,6 @@ fn format_invoice_number(format: &str, year: u32, seq: u32) -> String {
         .replace("{seq:05}", &format!("{:05}", seq))
         .replace("{seq:03}", &format!("{:03}", seq))
 }
-
-use chrono::Datelike;
 
 /// Edit an existing invoice
 fn cmd_edit(cfg_dir: &PathBuf, invoice_ref: &str, items: &[String]) -> Result<()> {
@@ -738,6 +765,177 @@ fn cmd_regenerate(cfg_dir: &PathBuf, invoice_ref: &str, open: bool) -> Result<()
     Ok(())
 }
 
+/// Record a payment against an invoice
+fn cmd_add_payment(
+    cfg_dir: &PathBuf,
+    invoice_ref: &str,
+    amount: f64,
+    date_str: Option<String>,
+) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    // Validate amount
+    if amount <= 0.0 {
+        return Err(InvoiceError::InvalidPaymentAmount);
+    }
+
+    let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
+    let mut state = load_state(cfg_dir)?;
+    let config = load_config(cfg_dir)?;
+
+    // Parse payment date (default to today)
+    let date = match date_str {
+        Some(s) => chrono::NaiveDate::parse_from_str(&s, "%Y-%m-%d")
+            .map_err(|_| InvoiceError::PdfGeneration(format!("Invalid --date value: '{s}'")))?,
+        None => chrono::Local::now().date_naive(),
+    };
+
+    let entry = state
+        .history
+        .iter_mut()
+        .find(|e| e.number == invoice_number)
+        .ok_or_else(|| InvoiceError::InvoiceNotFound(invoice_number.clone()))?;
+
+    // Guard against overpayment
+    let remaining = entry.outstanding();
+    if amount > remaining + 0.001 {
+        return Err(InvoiceError::OverPayment {
+            invoice: invoice_number,
+            max: remaining,
+        });
+    }
+
+    entry.payments.push(Payment { amount, date });
+    let new_outstanding = entry.outstanding();
+    let inv_number = entry.number.clone();
+
+    save_state(cfg_dir, &state)?;
+
+    // Print confirmation
+    if new_outstanding <= 0.001 {
+        println!(
+            "Recorded {}{:.2} payment for {} (fully paid)",
+            config.invoice.currency_symbol, amount, inv_number
+        );
+    } else {
+        println!(
+            "Recorded {}{:.2} payment for {} ({}{:.2} remaining)",
+            config.invoice.currency_symbol,
+            amount,
+            inv_number,
+            config.invoice.currency_symbol,
+            new_outstanding
+        );
+    }
+
+    Ok(())
+}
+
+/// Remove a payment from an invoice
+fn cmd_remove_payment(
+    cfg_dir: &PathBuf,
+    invoice_ref: &str,
+    index: Option<usize>,
+) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
+    let mut state = load_state(cfg_dir)?;
+    let config = load_config(cfg_dir)?;
+
+    let entry = state
+        .history
+        .iter_mut()
+        .find(|e| e.number == invoice_number)
+        .ok_or_else(|| InvoiceError::InvoiceNotFound(invoice_number.clone()))?;
+
+    if entry.payments.is_empty() {
+        return Err(InvoiceError::NoPayments(invoice_number));
+    }
+
+    // Determine which payment to remove (1-based index, default to last)
+    let remove_idx = match index {
+        Some(i) => {
+            if i == 0 || i > entry.payments.len() {
+                return Err(InvoiceError::InvalidPaymentIndex {
+                    invoice: invoice_number,
+                    index: i,
+                    count: entry.payments.len(),
+                });
+            }
+            i - 1
+        }
+        None => entry.payments.len() - 1,
+    };
+
+    let removed = entry.payments.remove(remove_idx);
+    let inv_number = entry.number.clone();
+
+    save_state(cfg_dir, &state)?;
+
+    println!(
+        "Removed {}{:.2} payment from {}",
+        config.invoice.currency_symbol, removed.amount, inv_number
+    );
+
+    Ok(())
+}
+
+/// Show payment history for an invoice
+fn cmd_payments(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
+    if !cfg_dir.exists() {
+        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
+    }
+
+    let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
+    let state = load_state(cfg_dir)?;
+    let config = load_config(cfg_dir)?;
+
+    let entry = state
+        .history
+        .iter()
+        .find(|e| e.number == invoice_number)
+        .ok_or_else(|| InvoiceError::InvoiceNotFound(invoice_number.clone()))?;
+
+    println!("Payments for {}", invoice_number);
+
+    if entry.payments.is_empty() {
+        println!("  No payments recorded.");
+    } else {
+        let rows: Vec<PaymentRow> = entry
+            .payments
+            .iter()
+            .enumerate()
+            .map(|(idx, p)| PaymentRow {
+                index: idx + 1,
+                date: p.date.to_string(),
+                amount: format!(
+                    "{}{:.2}",
+                    config.invoice.currency_symbol, p.amount
+                ),
+            })
+            .collect();
+
+        let table = Table::new(rows).with(Style::rounded()).to_string();
+        println!("{table}");
+    }
+
+    println!(
+        "Total paid: {}{:.2} / {}{:.2} (Status: {})",
+        config.invoice.currency_symbol,
+        entry.paid_amount(),
+        config.invoice.currency_symbol,
+        entry.total,
+        entry.status()
+    );
+
+    Ok(())
+}
+
 /// Generate a PDF report of invoices for a client
 fn cmd_report(
     cfg_dir: &PathBuf,
@@ -777,16 +975,16 @@ fn cmd_report(
         })
         .transpose()?;
 
-    // Validate status filter
+    // Validate status filter — now accepts "partial" too
     if let Some(ref s) = status {
-        if s != "paid" && s != "unpaid" {
+        if s != "paid" && s != "unpaid" && s != "partial" {
             return Err(InvoiceError::PdfGeneration(format!(
-                "Invalid --status value: '{s}'. Use 'paid' or 'unpaid'."
+                "Invalid --status value: '{s}'. Use 'paid', 'unpaid', or 'partial'."
             )));
         }
     }
 
-    // Filter history entries for this client
+    // Filter history entries for this client using three-way status
     let filtered: Vec<_> = state
         .history
         .iter()
@@ -794,8 +992,9 @@ fn cmd_report(
         .filter(|e| from_date.map_or(true, |d| e.date >= d))
         .filter(|e| to_date.map_or(true, |d| e.date <= d))
         .filter(|e| match status.as_deref() {
-            Some("paid") => e.paid,
-            Some("unpaid") => !e.paid,
+            Some("paid") => e.status() == PaymentStatus::Paid,
+            Some("unpaid") => e.status() == PaymentStatus::Unpaid,
+            Some("partial") => e.status() == PaymentStatus::Partial,
             _ => true,
         })
         .collect();
@@ -805,24 +1004,20 @@ fn cmd_report(
         return Ok(());
     }
 
-    // Build report rows
+    // Build report rows with three-way status
     let rows: Vec<ReportInvoiceRow> = filtered
         .iter()
         .map(|e| ReportInvoiceRow {
             number: e.number.clone(),
             date: e.date.format("%B %d, %Y").to_string(),
             total: e.total,
-            status: if e.paid {
-                "PAID".to_string()
-            } else {
-                "UNPAID".to_string()
-            },
+            status: e.status().to_string(),
         })
         .collect();
 
-    // Calculate financial summary
+    // Financial summary uses actual payment amounts
     let total: f64 = filtered.iter().map(|e| e.total).sum();
-    let paid: f64 = filtered.iter().filter(|e| e.paid).map(|e| e.total).sum();
+    let paid: f64 = filtered.iter().map(|e| e.paid_amount()).sum();
     let outstanding = total - paid;
 
     let today = chrono::Local::now().format("%B %d, %Y").to_string();
@@ -887,37 +1082,4 @@ fn format_report_amount(value: f64) -> String {
     } else {
         format!("{}.{}", grouped, frac)
     }
-}
-
-fn set_invoice_payment_status(cfg_dir: &PathBuf, invoice_ref: &str, paid: bool) -> Result<String> {
-    let invoice_number = resolve_invoice_number(cfg_dir, invoice_ref)?;
-    let mut state = load_state(cfg_dir)?;
-    let entry = state
-        .history
-        .iter_mut()
-        .find(|entry| entry.number == invoice_number)
-        .ok_or_else(|| InvoiceError::InvoiceNotFound(invoice_number.clone()))?;
-    entry.paid = paid;
-    save_state(cfg_dir, &state)?;
-    Ok(invoice_number)
-}
-
-fn cmd_mark_paid(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
-    if !cfg_dir.exists() {
-        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
-    }
-
-    let invoice_number = set_invoice_payment_status(cfg_dir, invoice_ref, true)?;
-    println!("Marked {} as paid", invoice_number);
-    Ok(())
-}
-
-fn cmd_mark_unpaid(cfg_dir: &PathBuf, invoice_ref: &str) -> Result<()> {
-    if !cfg_dir.exists() {
-        return Err(InvoiceError::ConfigNotFound(cfg_dir.clone()));
-    }
-
-    let invoice_number = set_invoice_payment_status(cfg_dir, invoice_ref, false)?;
-    println!("Marked {} as unpaid", invoice_number);
-    Ok(())
 }

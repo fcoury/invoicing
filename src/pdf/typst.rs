@@ -157,7 +157,7 @@ pub fn generate_pdf(invoice_data: &InvoiceData, output_path: &PathBuf) -> Result
     }
 
     // Create temp directory for template
-    let temp_dir = std::env::temp_dir().join("invoice-cli");
+    let temp_dir = std::env::temp_dir().join(format!("invoice-cli-{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir)?;
 
     // Serialize invoice data to JSON
@@ -342,7 +342,7 @@ pub fn generate_report_pdf(report_data: &ReportData, output_path: &PathBuf) -> R
     }
 
     // Create temp directory for template
-    let temp_dir = std::env::temp_dir().join("invoice-cli");
+    let temp_dir = std::env::temp_dir().join(format!("invoice-cli-{}", std::process::id()));
     std::fs::create_dir_all(&temp_dir)?;
 
     // Serialize report data to JSON

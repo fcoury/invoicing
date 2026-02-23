@@ -305,7 +305,7 @@ pub fn generate_invoice(
         date: NaiveDate::from_ymd_opt(today.year(), today.month(), today.day()).unwrap(),
         total,
         file: pdf_filename,
-        paid: false,
+        payments: vec![],
         items: items_input.to_vec(),
     });
 

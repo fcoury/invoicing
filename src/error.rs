@@ -58,6 +58,22 @@ pub enum InvoiceError {
 
     #[error("Invoice file not found: {0}")]
     InvoiceFileNotFound(PathBuf),
+
+    #[error("Payment would exceed invoice total (max ${max:.2} remaining)")]
+    OverPayment { invoice: String, max: f64 },
+
+    #[error("No payments recorded for {0}")]
+    NoPayments(String),
+
+    #[error("Invalid payment index {index} for {invoice} (only {count} payment(s) recorded)")]
+    InvalidPaymentIndex {
+        invoice: String,
+        index: usize,
+        count: usize,
+    },
+
+    #[error("Payment amount must be greater than zero")]
+    InvalidPaymentAmount,
 }
 
 pub type Result<T> = std::result::Result<T, InvoiceError>;

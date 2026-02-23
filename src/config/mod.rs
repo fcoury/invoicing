@@ -1,7 +1,7 @@
 mod client;
 mod company;
 mod item;
-mod state;
+pub mod state;
 
 pub use client::Client;
 pub use company::{Company, Config};
