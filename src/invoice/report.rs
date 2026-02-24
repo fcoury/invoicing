@@ -2,12 +2,22 @@ use serde::Serialize;
 
 use crate::config::{Client, Company};
 
+/// A single payment line item for display in report detail rows
+#[derive(Debug, Serialize)]
+pub struct ReportPayment {
+    pub amount: f64,
+    pub date: String,
+}
+
 /// A single row in the invoice report table
 #[derive(Debug, Serialize)]
 pub struct ReportInvoiceRow {
     pub number: String,
     pub date: String,
     pub total: f64,
+    pub paid: f64,
+    pub outstanding: f64,
+    pub payments: Vec<ReportPayment>,
     pub status: String,
 }
 

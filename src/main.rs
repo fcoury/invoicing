@@ -17,6 +17,7 @@ use crate::config::{
 use crate::error::{InvoiceError, Result};
 use crate::invoice::{
     generate_invoice, get_invoice_path, regenerate_invoice, ReportData, ReportInvoiceRow,
+    ReportPayment,
 };
 use crate::pdf::generate_report_pdf;
 
@@ -1011,6 +1012,16 @@ fn cmd_report(
             number: e.number.clone(),
             date: e.date.format("%B %d, %Y").to_string(),
             total: e.total,
+            paid: e.paid_amount(),
+            outstanding: e.outstanding(),
+            payments: e
+                .payments
+                .iter()
+                .map(|p| ReportPayment {
+                    amount: p.amount,
+                    date: p.date.format("%B %d, %Y").to_string(),
+                })
+                .collect(),
             status: e.status().to_string(),
         })
         .collect();

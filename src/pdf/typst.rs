@@ -290,22 +290,37 @@ const REPORT_TEMPLATE: &str = r##"// Invoice Report Template
 
 // Invoice table
 #table(
-  columns: (auto, 1fr, auto, auto),
-  align: (left, left, right, center),
+  columns: (auto, 1fr, auto, auto, auto, auto),
+  align: (left, left, right, right, right, center),
   stroke: (x, y) => if y == 0 { (bottom: 1pt + black) } else if y > 0 { (bottom: 0.5pt + gray) },
   inset: 8pt,
   fill: (x, y) => if y == 0 { luma(240) } else { none },
 
   // Header
-  [*Number*], [*Date*], [*Total*], [*Status*],
+  [*Number*], [*Date*], [*Total*], [*Paid*], [*Outstanding*], [*Status*],
 
-  // Rows
-  ..data.rows.map(row => (
-    row.number,
-    row.date,
-    [#fmt-currency(row.total)],
-    row.status,
-  )).flatten()
+  // Rows with optional payment detail sub-rows for PARTIAL invoices
+  ..data.rows.map(row => {
+    let cells = (
+      row.number,
+      row.date,
+      [#fmt-currency(row.total)],
+      [#fmt-currency(row.paid)],
+      [#fmt-currency(row.outstanding)],
+      row.status,
+    )
+    if row.payments.len() > 0 and row.status == "PARTIAL" {
+      // Append a detail sub-row spanning all columns
+      let details = row.payments.map(p =>
+        [#h(1em)#sym.arrow.r #fmt-currency(p.amount) on #p.date]
+      ).join(linebreak())
+      (..cells, table.cell(colspan: 6, inset: (left: 24pt, top: 2pt, bottom: 6pt, right: 8pt))[
+        #text(size: 8pt, fill: gray)[#details]
+      ])
+    } else {
+      cells
+    }
+  }).flatten()
 )
 
 #v(1.5em)
